@@ -10,10 +10,18 @@ import json
 import os
 from datetime import datetime
 import argparse
+from concurrent.futures import ThreadPoolExecutor, as_completed
 
 THEMES_DIR = "themes"
 FONTS_DIR = "fonts"
 POSTERS_DIR = "posters"
+
+# Enable OSMnx cache on disk
+ox.settings.use_cache = True
+ox.settings.cache_folder = "cache"
+
+# Session cache for fetched map data (in-memory)
+_MAP_DATA_CACHE = {}
 
 def load_fonts():
     """
@@ -213,34 +221,147 @@ def get_coordinates(city, country):
     else:
         raise ValueError(f"Could not find coordinates for {city}, {country}")
 
-def create_poster(city, country, point, dist, output_file):
-    print(f"\nGenerating map for {city}, {country}...")
-    
-    # Progress bar for data fetching
-    with tqdm(total=3, desc="Fetching map data", unit="step", bar_format='{l_bar}{bar}| {n_fmt}/{total_fmt}') as pbar:
-        # 1. Fetch Street Network
-        pbar.set_description("Downloading street network")
-        G = ox.graph_from_point(point, dist=dist, dist_type='bbox', network_type='all')
-        pbar.update(1)
-        time.sleep(0.5)  # Rate limit between requests
-        
-        # 2. Fetch Water Features
-        pbar.set_description("Downloading water features")
-        try:
-            water = ox.features_from_point(point, tags={'natural': 'water', 'waterway': 'riverbank'}, dist=dist)
-        except:
+def _format_bytes(num_bytes):
+    if num_bytes is None:
+        return "n/a"
+    if num_bytes < 1024:
+        return f"{num_bytes} B"
+    if num_bytes < 1024 * 1024:
+        return f"{num_bytes / 1024:.1f} KB"
+    return f"{num_bytes / (1024 * 1024):.1f} MB"
+
+
+def _get_map_data(point, dist, show_water, show_parks, parallel_fetch, progress_cb=None):
+    cache_key = (round(point[0], 5), round(point[1], 5), int(dist), show_water, show_parks)
+    if cache_key in _MAP_DATA_CACHE:
+        if progress_cb:
+            progress_cb(1.0, desc="Using cached map data")
+        return _MAP_DATA_CACHE[cache_key]
+
+    total_steps = 1 + (1 if show_water else 0) + (1 if show_parks else 0)
+    with tqdm(total=total_steps, desc="Fetching map data", unit="step", bar_format='{l_bar}{bar}| {n_fmt}/{total_fmt}') as pbar:
+        if parallel_fetch:
+            tasks = {}
+            results = {"graph": None, "water": None, "parks": None}
+            with ThreadPoolExecutor(max_workers=3) as executor:
+                start_times = {}
+                future = executor.submit(ox.graph_from_point, point, dist=dist, dist_type='bbox', network_type='all')
+                tasks[future] = "graph"
+                start_times[future] = time.perf_counter()
+                if show_water:
+                    future = executor.submit(
+                        ox.features_from_point,
+                        point,
+                        tags={'natural': 'water', 'waterway': 'riverbank'},
+                        dist=dist,
+                    )
+                    tasks[future] = "water"
+                    start_times[future] = time.perf_counter()
+                if show_parks:
+                    future = executor.submit(
+                        ox.features_from_point,
+                        point,
+                        tags={'leisure': 'park', 'landuse': 'grass'},
+                        dist=dist,
+                    )
+                    tasks[future] = "parks"
+                    start_times[future] = time.perf_counter()
+
+                completed = 0
+                for future in as_completed(tasks):
+                    kind = tasks[future]
+                    elapsed = time.perf_counter() - start_times.get(future, time.perf_counter())
+                    try:
+                        results[kind] = future.result()
+                    except:
+                        results[kind] = None
+                    pbar.update(1)
+                    completed += 1
+                    if progress_cb:
+                        size_bytes = None
+                        if kind in ("water", "parks") and results[kind] is not None:
+                            try:
+                                size_bytes = results[kind].memory_usage(deep=True).sum()
+                            except:
+                                size_bytes = None
+                        if kind == "graph" and results[kind] is not None:
+                            desc = f"Downloaded roads: {results[kind].number_of_nodes()} nodes, {results[kind].number_of_edges()} edges in {elapsed:.1f}s"
+                        else:
+                            desc = f"Downloaded {kind}: {_format_bytes(size_bytes)} in {elapsed:.1f}s"
+                        progress_cb(completed / total_steps, desc=desc)
+
+            G = results["graph"]
+            water = results["water"]
+            parks = results["parks"]
+        else:
+            pbar.set_description("Downloading street network")
+            if progress_cb:
+                progress_cb(0.0, desc="Downloading roads...")
+            G = ox.graph_from_point(point, dist=dist, dist_type='bbox', network_type='all')
+            pbar.update(1)
+            time.sleep(0.5)
+            if progress_cb:
+                progress_cb(1 / total_steps, desc=f"Downloaded roads: {G.number_of_nodes()} nodes, {G.number_of_edges()} edges")
+
             water = None
-        pbar.update(1)
-        time.sleep(0.3)
-        
-        # 3. Fetch Parks
-        pbar.set_description("Downloading parks/green spaces")
-        try:
-            parks = ox.features_from_point(point, tags={'leisure': 'park', 'landuse': 'grass'}, dist=dist)
-        except:
+            if show_water:
+                pbar.set_description("Downloading water features")
+                if progress_cb:
+                    progress_cb(pbar.n / total_steps, desc="Downloading water...")
+                try:
+                    water = ox.features_from_point(point, tags={'natural': 'water', 'waterway': 'riverbank'}, dist=dist)
+                except:
+                    water = None
+                pbar.update(1)
+                time.sleep(0.3)
+                if progress_cb and water is not None:
+                    try:
+                        size_bytes = water.memory_usage(deep=True).sum()
+                    except:
+                        size_bytes = None
+                    progress_cb(pbar.n / total_steps, desc=f"Downloaded water: {_format_bytes(size_bytes)}")
+
             parks = None
-        pbar.update(1)
-    
+            if show_parks:
+                pbar.set_description("Downloading parks/green spaces")
+                if progress_cb:
+                    progress_cb(pbar.n / total_steps, desc="Downloading parks...")
+                try:
+                    parks = ox.features_from_point(point, tags={'leisure': 'park', 'landuse': 'grass'}, dist=dist)
+                except:
+                    parks = None
+                pbar.update(1)
+                if progress_cb and parks is not None:
+                    try:
+                        size_bytes = parks.memory_usage(deep=True).sum()
+                    except:
+                        size_bytes = None
+                    progress_cb(pbar.n / total_steps, desc=f"Downloaded parks: {_format_bytes(size_bytes)}")
+
+    if G is None:
+        raise RuntimeError("Failed to download street network data.")
+
+    _MAP_DATA_CACHE[cache_key] = (G, water, parks)
+    return _MAP_DATA_CACHE[cache_key]
+
+
+def create_poster(
+    city,
+    country,
+    point,
+    dist,
+    output_file,
+    show_water=True,
+    show_parks=True,
+    show_roads=True,
+    show_gradients=True,
+    parallel_fetch=False,
+    progress_cb=None,
+):
+    print(f"\nGenerating map for {city}, {country}...")
+
+    G, water, parks = _get_map_data(point, dist, show_water, show_parks, parallel_fetch, progress_cb=progress_cb)
+
     print("✓ All data downloaded successfully!")
     
     # 2. Setup Plot
@@ -251,27 +372,29 @@ def create_poster(city, country, point, dist, output_file):
     
     # 3. Plot Layers
     # Layer 1: Polygons
-    if water is not None and not water.empty:
+    if show_water and water is not None and not water.empty:
         water.plot(ax=ax, facecolor=THEME['water'], edgecolor='none', zorder=1)
-    if parks is not None and not parks.empty:
+    if show_parks and parks is not None and not parks.empty:
         parks.plot(ax=ax, facecolor=THEME['parks'], edgecolor='none', zorder=2)
     
     # Layer 2: Roads with hierarchy coloring
-    print("Applying road hierarchy colors...")
-    edge_colors = get_edge_colors_by_type(G)
-    edge_widths = get_edge_widths_by_type(G)
-    
-    ox.plot_graph(
-        G, ax=ax, bgcolor=THEME['bg'],
-        node_size=0,
-        edge_color=edge_colors,
-        edge_linewidth=edge_widths,
-        show=False, close=False
-    )
+    if show_roads:
+        print("Applying road hierarchy colors...")
+        edge_colors = get_edge_colors_by_type(G)
+        edge_widths = get_edge_widths_by_type(G)
+        
+        ox.plot_graph(
+            G, ax=ax, bgcolor=THEME['bg'],
+            node_size=0,
+            edge_color=edge_colors,
+            edge_linewidth=edge_widths,
+            show=False, close=False
+        )
     
     # Layer 3: Gradients (Top and Bottom)
-    create_gradient_fade(ax, THEME['gradient_color'], location='bottom', zorder=10)
-    create_gradient_fade(ax, THEME['gradient_color'], location='top', zorder=10)
+    if show_gradients:
+        create_gradient_fade(ax, THEME['gradient_color'], location='bottom', zorder=10)
+        create_gradient_fade(ax, THEME['gradient_color'], location='top', zorder=10)
     
     # 4. Typography using Roboto font
     if FONTS:

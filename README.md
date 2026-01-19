@@ -32,6 +32,14 @@ pip install -r requirements.txt
 python create_map_poster.py --city <city> --country <country> [options]
 ```
 
+## Gradio App
+
+Launch the interactive UI with a city/country input, theme dropdown, and poster preview:
+
+```bash
+python app.py
+```
+
 ### Options
 
 | Option | Short | Description | Default |
